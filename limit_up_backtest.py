@@ -7,6 +7,7 @@
   - 若沒鎖死：當天收盤賣出，損益 = 當天收盤價 - 當天最高(漲停)價
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -22,11 +23,35 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 TICKER = "2454.TW"
 START_DATE = "2026-01-01"  # 可調整成更早日期以擴大回測範圍
 LIMIT_UP_PCT = 0.10        # 台股個股漲停幅度
-EPSILON = 0.001            # 容忍跳動點位取整造成的誤差
+PRICE_EPS = 1e-4           # 價格比對的 float 容忍（絕對值，非百分比）
 
 OUT_DIR = Path(__file__).parent
 TRADES_CSV = OUT_DIR / "trades.csv"
 CHART_PNG = OUT_DIR / "cumulative_pnl.png"
+
+
+# --- 台股漲停價計算（與 market_limit_up_backtest.py / market_liquidity_backtest.py 保持同步）---
+def twse_tick(price: float) -> float:
+    """TWSE 股票的升降單位（tick），依價位帶決定。"""
+    if price < 10:
+        return 0.01
+    elif price < 50:
+        return 0.05
+    elif price < 100:
+        return 0.1
+    elif price < 500:
+        return 0.5
+    elif price < 1000:
+        return 1.0
+    else:
+        return 5.0
+
+
+def limit_up_price(prev_close: float) -> float:
+    """漲停價 = 前收盤 × 1.1，再無條件捨去到該價位的升降單位。"""
+    raw = prev_close * (1 + LIMIT_UP_PCT)
+    tick = twse_tick(raw)
+    return math.floor(raw / tick + 1e-9) * tick
 
 
 def fetch_data(ticker: str, start: str) -> pd.DataFrame:
@@ -41,7 +66,9 @@ def fetch_data(ticker: str, start: str) -> pd.DataFrame:
 def find_trades(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["prev_close"] = df["Close"].shift(1)
-    df["limit_up_price"] = df["prev_close"] * (1 + LIMIT_UP_PCT)
+    df["limit_up_price"] = df["prev_close"].apply(
+        lambda p: limit_up_price(p) if pd.notna(p) else float("nan")
+    )
 
     trades = []
     n = len(df)
@@ -51,11 +78,12 @@ def find_trades(df: pd.DataFrame) -> pd.DataFrame:
         if pd.isna(limit_price):
             continue
 
-        touched = row["High"] >= limit_price * (1 - EPSILON)
+        touched = row["High"] >= limit_price - PRICE_EPS
         if not touched:
             continue
 
-        locked = row["Close"] >= limit_price * (1 - EPSILON)
+        # high <= 真實漲停價 恒成立，故 close 觸及漲停價時必然 close == high == 漲停價
+        locked = row["Close"] >= limit_price - PRICE_EPS
         date = df.index[i]
 
         if locked:

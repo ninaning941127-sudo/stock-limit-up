@@ -27,7 +27,7 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 DATA_XLSX = r"C:\TejPro\TejPro\DataExport\20260708215428DataExport.xlsx"
 LIMIT_UP_PCT = 0.10
-EPSILON = 0.001
+PRICE_EPS = 1e-4           # 價格比對的 float 容忍（絕對值，非百分比）
 
 OUT_DIR = Path(__file__).parent
 TRADES_CSV = OUT_DIR / "market_trades.csv"
@@ -47,6 +47,18 @@ COLUMN_MAP = {
 }
 
 
+# --- 台股漲停價計算（與 limit_up_backtest.py / market_liquidity_backtest.py 保持同步）---
+def limit_up_price_vec(prev_close):
+    """漲停價 = 前收盤 × 1.1，再無條件捨去到該價位的升降單位（向量化）。"""
+    raw = prev_close * (1 + LIMIT_UP_PCT)
+    tick = np.select(
+        [raw < 10, raw < 50, raw < 100, raw < 500, raw < 1000],
+        [0.01, 0.05, 0.1, 0.5, 1.0],
+        default=5.0,
+    )
+    return np.floor(raw / tick + 1e-9) * tick
+
+
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="Sheet")
     df = df.rename(columns=COLUMN_MAP)
@@ -60,11 +72,12 @@ def find_trades(df: pd.DataFrame):
     g = df.groupby("code", sort=False)
     df["prev_close"] = g["close"].shift(1)
     df["next_open"] = g["open"].shift(-1)
-    df["limit_up_price"] = df["prev_close"] * (1 + LIMIT_UP_PCT)
+    df["limit_up_price"] = limit_up_price_vec(df["prev_close"])
 
-    touched = df["high"] >= df["limit_up_price"] * (1 - EPSILON)
+    touched = df["high"] >= df["limit_up_price"] - PRICE_EPS
     events = df[touched].copy()
-    events["locked"] = events["close"] >= events["limit_up_price"] * (1 - EPSILON)
+    # high <= 真實漲停價 恒成立，故 close 觸及漲停價時必然 close == high == 漲停價
+    events["locked"] = events["close"] >= events["limit_up_price"] - PRICE_EPS
 
     locked_events = events[events["locked"]].copy()
     pending = locked_events[locked_events["next_open"].isna()].copy()
@@ -126,20 +139,49 @@ def statistical_tests(trades: pd.DataFrame):
     locked_pnl = trades.loc[trades["type"] == "locked", "pnl_pct"]
     not_locked_pnl = trades.loc[trades["type"] == "not_locked", "pnl_pct"]
 
-    print("\n[單樣本 t 檢定] 平均報酬率是否顯著不等於 0：")
+    # [主要] 按交易日聚合後再檢定：同一天數十檔同時漲停的報酬高度相關，
+    # 直接把每筆當獨立樣本會嚴重高估顯著性（低估標準誤）。先取每日平均報酬，
+    # 以「交易日數」為有效樣本數做檢定，才是對群聚結構穩健的推論。
+    print("\n[主要｜按日聚合 單樣本 t 檢定] 每日平均報酬率是否顯著不等於 0：")
+    for label, sub in [
+        ("整體", trades),
+        ("僅鎖死", trades[trades["type"] == "locked"]),
+        ("僅未鎖死", trades[trades["type"] == "not_locked"]),
+    ]:
+        daily = sub.groupby("date")["pnl_pct"].mean()
+        if len(daily) < 2:
+            print(f"  {label}：交易日數 {len(daily)} 不足，略過")
+            continue
+        t_stat, p_value = stats.ttest_1samp(daily, popmean=0)
+        print(
+            f"  {label}：每日平均={daily.mean():.4%}, 交易日數={len(daily)}, "
+            f"t={t_stat:.3f}, p={p_value:.4g}"
+        )
+
+    print("\n[參考｜未修正群聚 單樣本 t 檢定] 逐筆當獨立樣本——p 值偏低估，僅供對照：")
     for label, series in [
         ("整體", trades["pnl_pct"]),
         ("僅鎖死", locked_pnl),
         ("僅未鎖死", not_locked_pnl),
     ]:
+        if len(series) < 2:
+            print(f"  {label}：n={len(series)} 不足，略過")
+            continue
         t_stat, p_value = stats.ttest_1samp(series, popmean=0)
-        print(f"  {label}：mean={series.mean():.4%}, n={len(series)}, t={t_stat:.3f}, p={p_value:.4g}")
+        note = "（≤0 為策略定義下的數學必然，非統計發現）" if label == "僅未鎖死" else ""
+        print(f"  {label}：mean={series.mean():.4%}, n={len(series)}, t={t_stat:.3f}, p={p_value:.4g}{note}")
 
     print("\n[兩樣本 t 檢定 (Welch)] 鎖死 vs 未鎖死的平均報酬率是否有顯著差異：")
-    t_stat2, p_value2 = stats.ttest_ind(locked_pnl, not_locked_pnl, equal_var=False)
-    print(f"  t={t_stat2:.3f}, p={p_value2:.4g}")
+    if len(locked_pnl) < 2 or len(not_locked_pnl) < 2:
+        print("  其中一組樣本不足，略過")
+    else:
+        t_stat2, p_value2 = stats.ttest_ind(locked_pnl, not_locked_pnl, equal_var=False)
+        print(f"  t={t_stat2:.3f}, p={p_value2:.4g}"
+              "（未鎖死組報酬 ≤0 為定義恆等式，此差異部分屬數學必然）")
 
-    print("\n[線性迴歸] 累積報酬率曲線 vs 交易序號（檢驗趨勢是否顯著、線性配適程度 R²）：")
+    # 說明：逐日橫斷面 IC / IR 分析（見 ic_ir_analysis）才是對群聚結構穩健的主要證據。
+    print("\n[描述性｜線性迴歸] 累積報酬率曲線 vs 交易序號："
+          "R² 接近 1 只是累加序列的統計特性，不代表策略每天風險低，勿當作顯著性證據。")
     for label, sub in [
         ("整體", trades),
         ("僅鎖死", trades[trades["type"] == "locked"]),
@@ -147,6 +189,9 @@ def statistical_tests(trades: pd.DataFrame):
     ]:
         ordered = sub.sort_values("date")
         cum = ordered["pnl_pct"].cumsum().to_numpy()
+        if len(cum) < 2:
+            print(f"  {label}：n={len(cum)} 不足，略過")
+            continue
         x = np.arange(len(cum))
         result = stats.linregress(x, cum)
         print(

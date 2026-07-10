@@ -36,7 +36,7 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 DATA_XLSX = r"C:\TejPro\TejPro\DataExport\20260708230422DataExport.xlsx"
 LIMIT_UP_PCT = 0.10
-EPSILON = 0.001
+PRICE_EPS = 1e-4                  # 價格比對的 float 容忍（絕對值，非百分比）
 BASELINE_WINDOW = 20              # 過去幾個交易日算「正常」成交量基準
 MIN_BASELINE_DAYS = 5
 ASSUMED_TRADE_CAPITAL = 100_000   # 每筆交易假設投入的資金（元）
@@ -60,6 +60,18 @@ COLUMN_MAP = {
 }
 
 
+# --- 台股漲停價計算（與 limit_up_backtest.py / market_limit_up_backtest.py 保持同步）---
+def limit_up_price_vec(prev_close):
+    """漲停價 = 前收盤 × 1.1，再無條件捨去到該價位的升降單位（向量化）。"""
+    raw = prev_close * (1 + LIMIT_UP_PCT)
+    tick = np.select(
+        [raw < 10, raw < 50, raw < 100, raw < 500, raw < 1000],
+        [0.01, 0.05, 0.1, 0.5, 1.0],
+        default=5.0,
+    )
+    return np.floor(raw / tick + 1e-9) * tick
+
+
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="Sheet")
     df = df.rename(columns=COLUMN_MAP)
@@ -69,7 +81,7 @@ def load_data(path: str) -> pd.DataFrame:
     g = df.groupby("code", sort=False)
     df["prev_close"] = g["close"].shift(1)
     df["next_open"] = g["open"].shift(-1)
-    df["limit_up_price"] = df["prev_close"] * (1 + LIMIT_UP_PCT)
+    df["limit_up_price"] = limit_up_price_vec(df["prev_close"])
 
     # 過去 N 天（不含當天）的平均成交量，當作「正常流動性」基準
     df["volume_k_prior"] = g["volume_k"].shift(1)
@@ -82,9 +94,10 @@ def load_data(path: str) -> pd.DataFrame:
 
 
 def find_trades(df: pd.DataFrame):
-    touched = df["high"] >= df["limit_up_price"] * (1 - EPSILON)
+    touched = df["high"] >= df["limit_up_price"] - PRICE_EPS
     events = df[touched].copy()
-    events["locked"] = events["close"] >= events["limit_up_price"] * (1 - EPSILON)
+    # high <= 真實漲停價 恒成立，故 close 觸及漲停價時必然 close == high == 漲停價
+    events["locked"] = events["close"] >= events["limit_up_price"] - PRICE_EPS
 
     locked_events = events[events["locked"]].copy()
     pending = locked_events[locked_events["next_open"].isna()].copy()
@@ -137,23 +150,43 @@ def summarize_liquidity(trades: pd.DataFrame):
     print(by_type)
     print()
 
-    naive_total = trades["naive_pnl_twd"].sum()
-    realistic_total = trades["realistic_pnl_twd"].sum()
+    # 名目與折算後總損益必須涵蓋同一交易集合：realistic_pnl_twd 會因成交量缺值變 NaN，
+    # 若直接 sum() 會被靜默略過（當 0），但 naive 端仍計入該筆，使折算比例失真。
+    # 故兩端都只在「兩者皆非 NaN」的交易上加總。
+    valid = trades.dropna(subset=["naive_pnl_twd", "realistic_pnl_twd"])
+    excluded = len(trades) - len(valid)
+    naive_total = valid["naive_pnl_twd"].sum()
+    realistic_total = valid["realistic_pnl_twd"].sum()
+    ratio = realistic_total / naive_total if naive_total else float("nan")
     print(f"名目總損益（假設每筆都能全額投入 {ASSUMED_TRADE_CAPITAL:,.0f} 元）：{naive_total:,.0f} 元")
     print(f"流動性折算後總損益（每筆最多吃下當天成交量的 {PARTICIPATION_CAP:.0%}）：{realistic_total:,.0f} 元")
-    print(f"折算後剩餘比例：{realistic_total / naive_total:.1%}\n")
+    print(f"折算後剩餘比例：{ratio:.1%}")
+    if excluded:
+        print(f"（另有 {excluded} 筆因成交量缺值，未納入上述名目/折算比較）")
+    print()
 
     locked = trades[trades["type"] == "locked"].dropna(subset=["volume_ratio"]).copy()
+    if len(locked) < 4:
+        print(f"[鎖死組] 有效樣本 {len(locked)} 筆不足，略過相關性與分位分析。\n")
+        return locked, None
 
     rho, p = stats.spearmanr(locked["volume_ratio"], locked["pnl_pct"])
     print(f"[鎖死組] 相對量比 vs 報酬率 Spearman 相關：rho={rho:.3f}, p={p:.4g}")
     rho2, p2 = stats.spearmanr(locked["fill_ratio"], locked["pnl_pct"])
     print(f"[鎖死組] 可成交比例 vs 報酬率 Spearman 相關：rho={rho2:.3f}, p={p2:.4g}\n")
 
-    locked["liquidity_quartile"] = pd.qcut(
-        locked["volume_ratio"], 4,
-        labels=["Q1 最不流動", "Q2", "Q3", "Q4 最流動"],
-        duplicates="drop",
+    # qcut 用 labels=False 先取整數 bin，再依實際 bin 數動態命名；避免固定 4 個 labels
+    # 與 duplicates='drop' 相衝（量比高度集中時邊界重複被丟棄會直接 ValueError）。
+    codes = pd.qcut(locked["volume_ratio"], 4, labels=False, duplicates="drop")
+    n_bins = int(codes.max()) + 1
+    if n_bins < 2:
+        print("[鎖死組] 相對量比幾乎無變異，無法分位，略過。\n")
+        return locked, None
+    label_names = [f"Q{i + 1}" for i in range(n_bins)]
+    label_names[0] = "Q1 最不流動"
+    label_names[-1] = f"Q{n_bins} 最流動"
+    locked["liquidity_quartile"] = pd.Categorical.from_codes(
+        codes.astype(int), categories=label_names, ordered=True
     )
     quartile_stats = locked.groupby("liquidity_quartile", observed=True).agg(
         件數=("pnl_pct", "size"),
@@ -161,7 +194,7 @@ def summarize_liquidity(trades: pd.DataFrame):
         平均報酬率=("pnl_pct", "mean"),
         平均可成交比例=("fill_ratio", "mean"),
     )
-    print("[鎖死組] 依相對量比分四分位：")
+    print(f"[鎖死組] 依相對量比分 {n_bins} 分位：")
     print(quartile_stats)
     print()
 
@@ -224,15 +257,25 @@ def plot_scatter(locked: pd.DataFrame):
 def main():
     df = load_data(DATA_XLSX)
     trades, pending = find_trades(df)
+
+    if trades.empty:
+        print("沒有偵測到任何漲停事件。")
+        return
+
     trades = add_liquidity_model(trades)
 
     trades.to_csv(TRADES_CSV, index=False, encoding="utf-8-sig")
-    print(f"已存交易明細（含流動性欄位）：{TRADES_CSV}\n")
+    print(f"已存交易明細（含流動性欄位）：{TRADES_CSV}")
+    if len(pending):
+        print(f"（另有 {len(pending)} 筆鎖死漲停但尚無隔日資料，未計入分析）")
+    print()
 
     locked, quartile_stats = summarize_liquidity(trades)
-    plot_quartile_bar(quartile_stats)
+    if quartile_stats is not None:
+        plot_quartile_bar(quartile_stats)
     plot_capacity_curves(trades)
-    plot_scatter(locked)
+    if not locked.empty:
+        plot_scatter(locked)
 
 
 if __name__ == "__main__":
