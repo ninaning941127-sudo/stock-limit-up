@@ -13,20 +13,18 @@
 
 | 檔案 | 說明 |
 |---|---|
-| `limit_up_backtest.py` | 單一個股回測（預設聯發科 2454.TW，資料來自 yfinance），2026 年初至今 |
 | `market_limit_up_backtest.py` | 全台股回測，讀取 TEJ 匯出的 Excel，涵蓋 2026 年初至今約 1,900 檔股票 |
 | `market_liquidity_backtest.py` | 以成交量當流動性 proxy，估算「漲停鎖死」的名目獲利現實中有多少比例真的買得到 |
-| `trades.csv` / `market_trades.csv` | 個股／全市場的交易明細 |
+| `market_trades.csv` | 全市場交易明細 |
 | `market_liquidity_trades.csv` | 全市場交易明細（含成交量、量比、可成交比例、名目/折算後損益等流動性欄位） |
 | `market_daily_ic.csv` | 每日 IC（鎖死訊號 vs 實際報酬率）時間序列 |
-| `*.png` | 各項圖表（累積損益/報酬率曲線、報酬率分布、每日 IC、流動性四分位/散佈/折算曲線） |
+| `*.png` | 各項圖表（累積報酬率曲線、報酬率分布、每日 IC、流動性四分位/散佈/折算曲線） |
 
 ## 執行方式
 
 ```bash
-pip install yfinance pandas numpy matplotlib seaborn scipy openpyxl
+pip install pandas numpy matplotlib seaborn scipy openpyxl
 
-python limit_up_backtest.py            # 單一個股（2454.TW）
 python market_limit_up_backtest.py     # 全台股（需先把腳本裡的 DATA_XLSX
                                         # 指到你的 TEJ 匯出檔路徑）
 python market_liquidity_backtest.py    # 流動性分析（同樣需先設定自己的 DATA_XLSX，
