@@ -6,6 +6,8 @@
   - 鎖死到收盤：隔天開盤賣出，pnl = 隔天開盤價 - 當天收盤(漲停)價
   - 沒鎖死：當天收盤賣出，pnl = 當天收盤價 - 當天最高(漲停)價
 
+已扣除賣出時的證交稅（賣出成交價 × 0.3%），手續費仍未計入。
+
 因為橫跨上千檔不同價位的股票，統計與畫圖都以 pnl_pct（報酬率）為主，
 pnl（價差）只保留在明細表中做參考。
 """
@@ -29,6 +31,7 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 DATA_XLSX = r"C:\TejPro\TejPro\DataExport\20260708215428DataExport.xlsx"
 LIMIT_UP_PCT = 0.10
 PRICE_EPS = 1e-4           # 價格比對的 float 容忍（絕對值，非百分比）
+TAX_RATE = 0.003           # 證交稅：賣出成交價 × 0.3%（手續費未計入）
 
 OUT_DIR = Path(__file__).parent
 TRADES_CSV = OUT_DIR / "market_trades.csv"
@@ -95,6 +98,7 @@ def find_trades(df: pd.DataFrame):
 
     trades = pd.concat([locked_events, not_locked_events], ignore_index=True)
     trades["pnl"] = trades["exit_price"] - trades["entry_price"]
+    trades["pnl"] = trades["pnl"] - trades["exit_price"] * TAX_RATE  # 扣除賣出證交稅
     trades["pnl_pct"] = trades["pnl"] / trades["entry_price"]
     trades = trades.sort_values(["date", "code"]).reset_index(drop=True)
 
@@ -271,7 +275,7 @@ def plot_distribution(trades: pd.DataFrame):
         data=trades, x="pnl_pct", hue="type", element="step",
         stat="density", common_norm=False, kde=True, bins=40,
     )
-    plt.title("漲停事件報酬率分布（鎖死 vs 未鎖死）")
+    plt.title("漲停事件報酬率分布（鎖死 vs 未鎖死，已扣除賣出0.3%證交稅）")
     plt.xlabel("單筆報酬率")
     plt.ylabel("密度")
     plt.tight_layout()
@@ -308,7 +312,7 @@ def plot_daily_return(daily_df: pd.DataFrame):
     sns.lineplot(data=daily_df, x="date", y="daily_return", hue="series", marker="o", markersize=4)
     plt.axhline(0, color="gray", linewidth=0.8)
     plt.gca().yaxis.set_major_formatter(PercentFormatter(xmax=1))
-    plt.title("有交易當天的報酬率（同一天多筆交易先等權重平均）")
+    plt.title("有交易當天的報酬率（同一天多筆交易先等權重平均，已扣除賣出0.3%證交稅）")
     plt.xlabel("日期")
     plt.ylabel("當日報酬率")
     plt.xticks(rotation=45)
@@ -322,7 +326,7 @@ def plot_cumulative(daily_df: pd.DataFrame):
     sns.lineplot(data=daily_df, x="date", y="cum_return", hue="series", marker="o", markersize=4)
     plt.axhline(0, color="gray", linewidth=0.8)
     plt.gca().yaxis.set_major_formatter(PercentFormatter(xmax=1))
-    plt.title("全台股漲停策略 累積報酬率（每日報酬率加總，非複利）")
+    plt.title("全台股漲停策略 累積報酬率（每日報酬率加總，非複利，已扣除賣出0.3%證交稅）")
     plt.xlabel("日期")
     plt.ylabel("累積報酬率")
     plt.xticks(rotation=45)
